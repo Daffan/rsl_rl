@@ -28,6 +28,8 @@
 #
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
+import tree
+
 import torch
 import numpy as np
 
@@ -50,16 +52,20 @@ class RolloutStorage:
         def clear(self):
             self.__init__()
 
-    def __init__(self, num_envs, num_transitions_per_env, obs_shape, privileged_obs_shape, actions_shape, device='cpu'):
+    def __init__(self, num_envs, num_transitions_per_env, obs_space, privileged_obs_shape, actions_shape, device='cpu'):
 
         self.device = device
 
-        self.obs_shape = obs_shape
+        self.obs_space = obs_space
         self.privileged_obs_shape = privileged_obs_shape
         self.actions_shape = actions_shape
 
         # Core
-        self.observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
+        # self.observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
+        # ZIFAN: replace with dict obs space
+        self.observations = dict(zip(
+            obs_space.keys(), [torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device) for obs_shape in obs_space.values()]
+        ))
         if privileged_obs_shape[0] is not None:
             self.privileged_observations = torch.zeros(num_transitions_per_env, num_envs, *privileged_obs_shape, device=self.device)
         else:
@@ -88,7 +94,9 @@ class RolloutStorage:
     def add_transitions(self, transition: Transition):
         if self.step >= self.num_transitions_per_env:
             raise AssertionError("Rollout buffer overflow")
-        self.observations[self.step].copy_(transition.observations)
+        # self.observations[self.step].copy_(transition.observations)
+        for k in self.observations.keys():
+            self.observations[k][self.step].copy_(transition.observations[k])
         if self.privileged_observations is not None: self.privileged_observations[self.step].copy_(transition.critic_observations)
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
@@ -109,8 +117,8 @@ class RolloutStorage:
 
         # initialize if needed 
         if self.saved_hidden_states_a is None:
-            self.saved_hidden_states_a = [torch.zeros(self.observations.shape[0], *hid_a[i].shape, device=self.device) for i in range(len(hid_a))]
-            self.saved_hidden_states_c = [torch.zeros(self.observations.shape[0], *hid_c[i].shape, device=self.device) for i in range(len(hid_c))]
+            self.saved_hidden_states_a = [torch.zeros(self.actions.shape[0], *hid_a[i].shape, device=self.device) for i in range(len(hid_a))]
+            self.saved_hidden_states_c = [torch.zeros(self.actions.shape[0], *hid_c[i].shape, device=self.device) for i in range(len(hid_c))]
         # copy the states
         for i in range(len(hid_a)):
             self.saved_hidden_states_a[i][self.step].copy_(hid_a[i])
@@ -149,7 +157,11 @@ class RolloutStorage:
         mini_batch_size = batch_size // num_mini_batches
         indices = torch.randperm(num_mini_batches*mini_batch_size, requires_grad=False, device=self.device)
 
-        observations = self.observations.flatten(0, 1)
+        # observations = self.observations.flatten(0, 1)
+        # Flat the first two dim of (num_envs, n_steps, ...)
+        observations = tree.map_structure(
+            lambda obs: obs.flatten(0, 1), self.observations
+        )
         if self.privileged_observations is not None:
             critic_observations = self.privileged_observations.flatten(0, 1)
         else:
@@ -170,8 +182,13 @@ class RolloutStorage:
                 end = (i+1)*mini_batch_size
                 batch_idx = indices[start:end]
 
-                obs_batch = observations[batch_idx]
-                critic_observations_batch = critic_observations[batch_idx]
+                # ZIFAN: repalce with tree.map_structure
+                obs_batch = tree.map_structure(
+                    lambda obs: obs[batch_idx], observations
+                )
+                critic_observations_batch = tree.map_structure(
+                    lambda critic_obs: critic_obs[batch_idx], critic_observations
+                )
                 actions_batch = actions[batch_idx]
                 target_values_batch = values[batch_idx]
                 returns_batch = returns[batch_idx]
@@ -185,6 +202,7 @@ class RolloutStorage:
     # for RNNs only
     def reccurent_mini_batch_generator(self, num_mini_batches, num_epochs=8):
 
+        # TODO: check this later, RNN might cause issues
         padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
         if self.privileged_observations is not None: 
             padded_critic_obs_trajectories, _ = split_and_pad_trajectories(self.privileged_observations, self.dones)

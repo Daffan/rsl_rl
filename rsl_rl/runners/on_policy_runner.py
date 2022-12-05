@@ -32,6 +32,7 @@ import time
 import os
 from collections import deque
 import statistics
+import tree
 
 from torch.utils.tensorboard import SummaryWriter
 import torch
@@ -54,13 +55,15 @@ class OnPolicyRunner:
         self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env
+        obs_space = self.env.obs_space
+        # TODO: haven't check this privileged_obs, but all the examples do not use it
         if self.env.num_privileged_obs is not None:
             num_critic_obs = self.env.num_privileged_obs 
         else:
-            num_critic_obs = self.env.num_obs
+            critic_obs_space = obs_space
         actor_critic_class = eval(self.cfg["policy_class_name"]) # ActorCritic
-        actor_critic: ActorCritic = actor_critic_class( self.env.num_obs,
-                                                        num_critic_obs,
+        actor_critic: ActorCritic = actor_critic_class( obs_space,
+                                                        critic_obs_space,
                                                         self.env.num_actions,
                                                         **self.policy_cfg).to(self.device)
         alg_class = eval(self.cfg["algorithm_class_name"]) # PPO
@@ -69,7 +72,7 @@ class OnPolicyRunner:
         self.save_interval = self.cfg["save_interval"]
 
         # init storage and model
-        self.alg.init_storage(self.env.num_envs, self.num_steps_per_env, [self.env.num_obs], [self.env.num_privileged_obs], [self.env.num_actions])
+        self.alg.init_storage(self.env.num_envs, self.num_steps_per_env, obs_space, [self.env.num_privileged_obs], [self.env.num_actions])
 
         # Log
         self.log_dir = log_dir
@@ -89,7 +92,12 @@ class OnPolicyRunner:
         obs = self.env.get_observations()
         privileged_obs = self.env.get_privileged_observations()
         critic_obs = privileged_obs if privileged_obs is not None else obs
-        obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
+        obs = tree.map_structure(
+            lambda o: o.to(self.device), obs
+        )
+        critic_obs = tree.map_structure(
+            lambda o: o.to(self.device), critic_obs
+        )
         self.alg.actor_critic.train() # switch to train mode (for dropout for example)
 
         ep_infos = []
@@ -107,7 +115,13 @@ class OnPolicyRunner:
                     actions = self.alg.act(obs, critic_obs)
                     obs, privileged_obs, rewards, dones, infos = self.env.step(actions)
                     critic_obs = privileged_obs if privileged_obs is not None else obs
-                    obs, critic_obs, rewards, dones = obs.to(self.device), critic_obs.to(self.device), rewards.to(self.device), dones.to(self.device)
+                    obs = tree.map_structure(
+                        lambda o: o.to(self.device), obs
+                    )
+                    critic_obs = tree.map_structure(
+                        lambda o: o.to(self.device), critic_obs
+                    )
+                    rewards, dones = rewards.to(self.device), dones.to(self.device)
                     self.alg.process_env_step(rewards, dones, infos)
                     
                     if self.log_dir is not None:

@@ -37,8 +37,8 @@ from torch.nn.modules import rnn
 
 class ActorCritic(nn.Module):
     is_recurrent = False
-    def __init__(self,  num_actor_obs,
-                        num_critic_obs,
+    def __init__(self,  actor_obs_space,
+                        critic_obs_space,
                         num_actions,
                         actor_hidden_dims=[256, 256, 256],
                         critic_hidden_dims=[256, 256, 256],
@@ -51,8 +51,40 @@ class ActorCritic(nn.Module):
 
         activation = get_activation(activation)
 
-        mlp_input_dim_a = num_actor_obs
-        mlp_input_dim_c = num_critic_obs
+        if "depth_image" in actor_obs_space.keys():
+            self.cnn = True
+            self.image_conv = nn.Sequential(*[
+                nn.Conv2d(1, 32, kernel_size=[8, 8], stride=[4, 4]),
+                nn.ReLU(),
+                nn.Conv2d(32, 64, kernel_size=[4, 4], stride=[2, 2]),
+                nn.ReLU(),
+                nn.Conv2d(64, 64, kernel_size=[2, 2], stride=[2, 2]),
+                nn.ReLU(),
+                nn.Flatten()
+            ])
+            with torch.no_grad():
+                image_embed_dim = self.image_conv(
+                    torch.zeros(*actor_obs_space["depth_image"])[None, None]
+                ).shape[1]
+            # fc followed by the image conv before feeding to actor and critic net
+            self.fc = nn.Sequential(*[
+                nn.Linear(image_embed_dim, 512),
+                nn.ReLU(),
+                nn.Linear(512, 256),
+                nn.ReLU(),
+            ])
+            image_embed_dim = 256
+        else:
+            self.cnn = False
+            self.image_conv = None
+            self.fc = None
+            image_embed_dim = 0
+
+        # flat the obs space
+        mlp_input_dim_a = sum([np.prod(actor_obs_space[k]) for k in actor_obs_space.keys() if k != "depth_image"])
+        mlp_input_dim_a += image_embed_dim
+        mlp_input_dim_c = sum([np.prod(critic_obs_space[k]) for k in critic_obs_space.keys() if k != "depth_image"])
+        mlp_input_dim_c += image_embed_dim
 
         # Policy
         actor_layers = []
@@ -121,6 +153,11 @@ class ActorCritic(nn.Module):
         self.distribution = Normal(mean, mean*0. + self.std)
 
     def act(self, observations, **kwargs):
+        # concatenate the obs from diff keys
+        observations = torch.cat([
+            observations[k].flatten(1) if k != "depth_image" \
+            else self.fc(self.image_conv(observations[k][:, None])) for k in observations.keys()
+        ], dim=-1)
         self.update_distribution(observations)
         return self.distribution.sample()
     
@@ -128,10 +165,20 @@ class ActorCritic(nn.Module):
         return self.distribution.log_prob(actions).sum(dim=-1)
 
     def act_inference(self, observations):
+        # concatenate the obs from diff keys
+        observations = torch.cat([
+            observations[k].flatten(1) if k != "depth_image" \
+            else self.fc(self.image_conv(observations[k][:, None])) for k in observations.keys()
+        ], dim=-1)
         actions_mean = self.actor(observations)
         return actions_mean
 
     def evaluate(self, critic_observations, **kwargs):
+        # concatenate the obs from diff keys
+        critic_observations = torch.cat([
+            critic_observations[k].flatten(1) if k != "depth_image" \
+            else self.fc(self.image_conv(critic_observations[k][:, None])) for k in critic_observations.keys()
+        ], dim=-1)
         value = self.critic(critic_observations)
         return value
 
